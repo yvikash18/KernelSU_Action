@@ -1,13 +1,21 @@
-name: Build LineageOS 4.14 Kernel with ReSukiSU + eBPF
+name: Build LineageOS 4.14 Kernel (sunfish) with SukiSU-Ultra + eBPF
 
 on:
-  workflow_dispatch:        # manual trigger
+  workflow_dispatch:
     inputs:
       clean_ccache:
         description: 'Clean ccache before build?'
         required: false
         default: false
         type: boolean
+      ksu_source:
+        description: 'KSU variant setup branch (SukiSU-Ultra "main" or ReSukiSU "builtin")'
+        required: false
+        default: 'main'
+        type: choice
+        options:
+          - main      # SukiSU-Ultra/SukiSU-Ultra
+          - builtin   # ReSukiSU/ReSukiSU
 
 jobs:
   build:
@@ -26,25 +34,26 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y git make bc bison flex libssl-dev build-essential lld wget curl cpio gzip
+          sudo apt install -y git make bc bison flex libssl-dev build-essential \
+            lld wget curl cpio gzip zip unzip python3
 
       - name: Setup toolchains (Clang + GCC)
         run: |
-          mkdir -p $HOME/toolchain
-          cd $HOME/toolchain
+          mkdir -p "$HOME/toolchain"
+          cd "$HOME/toolchain"
           git clone --depth=1 https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b -b lineage-20.0 clang
           git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 -b lineage-19.1 gcc64
           git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 -b lineage-19.1 gcc32
-          echo "$HOME/toolchain/clang/bin" >> $GITHUB_PATH
-          echo "$HOME/toolchain/gcc64/bin" >> $GITHUB_PATH
-          echo "$HOME/toolchain/gcc32/bin" >> $GITHUB_PATH
+          echo "$HOME/toolchain/clang/bin" >> "$GITHUB_PATH"
+          echo "$HOME/toolchain/gcc64/bin" >> "$GITHUB_PATH"
+          echo "$HOME/toolchain/gcc32/bin" >> "$GITHUB_PATH"
 
       - name: Set environment
         run: |
-          echo "CROSS_COMPILE=aarch64-linux-android-" >> $GITHUB_ENV
-          echo "CROSS_COMPILE_ARM32=arm-linux-androideabi-" >> $GITHUB_ENV
-          echo "CC=clang" >> $GITHUB_ENV
-          echo "LD=ld.lld" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=aarch64-linux-android-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE_ARM32=arm-linux-androideabi-" >> "$GITHUB_ENV"
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "LD=ld.lld" >> "$GITHUB_ENV"
 
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -63,21 +72,41 @@ jobs:
           ref: lineage-23.2
           path: kernel
 
-      - name: Integrate ReSukiSU (built-in SUSFS)
+      # Pull KSU setup script to a temp file, inspect, then run — instead of curl | bash
+      # so a compromised script can't silently run with your token in context.
+      - name: Integrate KSU (SukiSU-Ultra / ReSukiSU with built-in SUSFS)
         working-directory: ./kernel
         run: |
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+          set -euo pipefail
+          if [ "${{ github.event.inputs.ksu_source }}" = "builtin" ]; then
+            SETUP_URL="https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/builtin/kernel/setup.sh"
+            SETUP_ARG="builtin"
+          else
+            SETUP_URL="https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh"
+            SETUP_ARG="main"
+          fi
+          curl -LSs "$SETUP_URL" -o /tmp/ksu_setup.sh
+          echo "----- setup.sh (first 40 lines, review in logs) -----"
+          head -n 40 /tmp/ksu_setup.sh
+          echo "-----------------------------------------------------"
+          bash /tmp/ksu_setup.sh "$SETUP_ARG"
 
-      - name: Configure kernel (enable ReSukiSU, SUSFS, eBPF, disable kprobe hook)
+      - name: Configure kernel (KSU + SUSFS + eBPF, manual hook, no kprobe hook)
         working-directory: ./kernel
         run: |
-          # Prevent long version string
+          set -euo pipefail
           touch .scmversion
-          ./scripts/config --file out/.config -d LOCALVERSION_AUTO 2>/dev/null || true
+
+          # Confirm the defconfig name actually exists on this branch before using it
+          if [ ! -f arch/arm64/configs/sunfish_defconfig ]; then
+            echo "::error::sunfish_defconfig not found — available arm64 defconfigs:"
+            ls arch/arm64/configs/
+            exit 1
+          fi
 
           make O=out ARCH=arm64 sunfish_defconfig
+          ./scripts/config --file out/.config -d LOCALVERSION_AUTO || true
 
-          # Enable features
           ./scripts/config --file out/.config \
             -e KSU \
             -e KSU_SUSFS \
@@ -93,21 +122,43 @@ jobs:
 
           make O=out ARCH=arm64 olddefconfig
 
+          # olddefconfig silently drops options whose deps aren't met — verify they survived
+          echo "----- verifying critical configs -----"
+          for opt in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KSU_MANUAL_HOOK \
+                     CONFIG_BPF_SYSCALL CONFIG_BPF_JIT; do
+            if grep -q "^${opt}=y" out/.config; then
+              echo "OK  $opt"
+            else
+              echo "::warning::$opt did NOT stick (dropped by olddefconfig or unmet dependency)"
+            fi
+          done
+          # kprobe hook must be OFF when using manual hooks
+          if grep -q "^CONFIG_KSU_KPROBES_HOOK=y" out/.config; then
+            echo "::error::KPROBES_HOOK is still enabled — conflicts with manual hook"
+            exit 1
+          fi
+
       - name: Build kernel Image
         working-directory: ./kernel
         run: |
-          make O=out ARCH=arm64 CC="ccache clang" LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- Image -j$(nproc)
+          set -euo pipefail
+          make O=out ARCH=arm64 \
+            CC="ccache clang" \
+            LD=ld.lld \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            Image -j"$(nproc)"
 
       - name: Verify build output
         id: check_image
         working-directory: ./kernel
         run: |
           if [ -f out/arch/arm64/boot/Image ]; then
-            echo "✅ Kernel Image found"
-            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Kernel Image found"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "❌ Kernel Image missing"
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Kernel Image missing"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
 
       - name: Upload kernel Image
@@ -118,19 +169,20 @@ jobs:
           path: kernel/out/arch/arm64/boot/Image
           retention-days: 7
 
-      # (Optional) If you have a stock boot.img in your repo, you can repack here
       - name: Check for stock boot.img
         id: check_boot
         run: |
           if [ -f "boot.img" ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "No stock boot.img in repo root — skipping repack"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Setup magiskboot
         if: steps.check_boot.outputs.exists == 'true'
         run: |
+          set -euo pipefail
           wget -q https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-v28.1.apk
           unzip -q Magisk-v28.1.apk -d magisk_extract
           cp magisk_extract/lib/x86_64/libmagiskboot.so magiskboot
@@ -140,17 +192,21 @@ jobs:
       - name: Repack boot image (if boot.img present)
         if: steps.check_boot.outputs.exists == 'true'
         run: |
-          cp boot.img boot_work.img
+          set -euo pipefail
+          # Work in a clean dir so magiskboot's extracted 'kernel' file
+          # never collides with the source tree's ./kernel directory.
+          mkdir -p repack && cd repack
+          cp "$GITHUB_WORKSPACE/boot.img" boot_work.img
           magiskboot unpack boot_work.img
-          mv kernel kernel.orig
-          cp kernel/out/arch/arm64/boot/Image kernel
+          # After unpack, ./kernel is the extracted kernel binary (a file). Replace it.
+          cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image" kernel
           magiskboot repack boot_work.img new_boot.img
-          echo "✅ Repacked new_boot.img"
+          echo "Repacked new_boot.img"
 
       - name: Upload repacked boot image
         if: steps.check_boot.outputs.exists == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: new-boot-image
-          path: new_boot.img
+          path: repack/new_boot.img
           retention-days: 7
