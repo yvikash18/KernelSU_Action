@@ -66,7 +66,7 @@ jobs:
       - name: Integrate ReSukiSU (built-in SUSFS)
         working-directory: ./kernel
         run: |
-          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/builtin/kernel/setup.sh" | bash -s builtin
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
 
       - name: Configure kernel (enable ReSukiSU, SUSFS, eBPF, disable kprobe hook)
         working-directory: ./kernel
